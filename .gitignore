@@ -1,0 +1,61 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.key
+credentials.json
+
+# Python venvs + caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints and training outputs
+*.pt
+*.pth
+*.ckpt
+*.onnx
+models/*.pt
+models/*.pth
+
+# Data (raw replays, parsed features, generated reports, debug logs, etc.)
+# Reference data that must be in-repo should live in `data/reference/`
+# which is NOT gitignored.
+data/
+!data/reference/
+*.osr
+*.osz
+*.bin
+
+# Build artifacts
+*.obj
+*.exe
+*.efi
+*.lib
+*.pdb
+*.ilk
+*.log
+*.log.err
+*.err
+build.log
+
+# Harness output
+artifacts/*
+!artifacts/.gitkeep
+
+# Backup files from migrations
+*.bak
+*.bak_*
+
+# Scratch
+*.hex
+scratchpad/
+mode_diff_baseline.hex
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,10 @@
+requests==2.32.3
+osrparse==6.0.2
+pandas==2.2.3
+numpy==2.1.3
+tqdm==4.66.5
+python-dotenv==1.0.1
+pyarrow==17.0.0
+# Minimal .osu parser is used; `slider` would be nicer but pulls heavy deps.
+# Torch pinned to a CPU wheel; GPU wheel can be installed separately by user.
+torch==2.5.1
