@@ -48,11 +48,11 @@ class Dispatcher:
         for d in self._pending:
             if now_bt_ms >= d.press_time_ms:
                 self.sink.press(d.key)
-                # slider holds should use d.press_time_ms + slider_duration; for
-                # circles use the short default. We default here because we don't
-                # carry kind on the decision; model_service could add it.
+                # Use the decision's own hold_ms (set by ModelService: real
+                # slider duration for sliders, 85ms default for circles).
+                hold = getattr(d, "hold_ms", self.default_hold_ms)
                 self._to_release.append(_PendingRelease(
-                    release_t_ms=d.press_time_ms + self.default_hold_ms,
+                    release_t_ms=d.press_time_ms + hold,
                     key=d.key,
                 ))
                 fired += 1

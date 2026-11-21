@@ -31,6 +31,7 @@ class PressDecision:
     center_idx: int
     press_time_ms: float
     key: str                  # "K1" | "K2"
+    hold_ms: float = 85.0     # how long to hold before releasing (slider end - press)
 
 
 class ModelService:
@@ -136,7 +137,15 @@ class ModelService:
             win = self.fb.build_window(state, i)
             press_t = self._sample_press_time(win, pid, h.t)
             key = self._pick_key(state, i, h.t)
-            d = PressDecision(center_idx=i, press_time_ms=press_t, key=key)
+            # Slider hold = (slider end time - press time). For circles use
+            # a short default. end_t is set on sliders & spinners; None on
+            # pure circles.
+            if h.kind == "slider" and h.end_t is not None:
+                hold_ms = max(30.0, float(h.end_t) - press_t)
+            else:
+                hold_ms = 85.0
+            d = PressDecision(center_idx=i, press_time_ms=press_t, key=key,
+                              hold_ms=hold_ms)
             self._decisions[i] = d
             decisions.append(d)
         return decisions

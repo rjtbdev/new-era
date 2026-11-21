@@ -174,29 +174,64 @@ def run_live(args, *, dry_run: bool):
     )
     dispatcher = Dispatcher(sink)
 
-    print(f"[live] waiting for play_mode=0 (std) and time to start advancing...")
-    # Wait until osu! is actually in a std map and clock is moving.
+    print(f"[live] waiting for a CLOCK RESET (click Play in osu! now)...")
+    # Watch for osu's `time` field to jump BACKWARD -- that's the song
+    # restarting / a new play starting. Only then do we plan. Avoids
+    # the "preview is playing at t=68s past end" trap.
+    #
+    # Fallback: if no reset seen in 60s but clock is advancing and well
+    # before map end, accept it (user may have already started playing).
     last_time = None
-    stable_advances = 0
+    reset_detected = False
+    tfirst_wait = time.perf_counter()
+    bm_first_ho = min((h.t for h in reader._hit_objects), default=0.0)
+    bm_last_ho  = max((h.t for h in reader._hit_objects), default=0.0)
     while True:
         state = reader.read()
-        if state.is_paused:
-            time.sleep(0.1)
-            continue
-        if state.time_ms != (last_time if last_time is not None else -999999):
-            stable_advances += 1 if last_time is not None else 0
-            last_time = state.time_ms
-            if stable_advances >= 3:
-                break
-        time.sleep(0.05)
+        if last_time is not None and state.time_ms + 500 < last_time:
+            reset_detected = True
+            print(f"[live] clock RESET detected ({last_time:.0f} -> {state.time_ms:.0f})")
+            break
+        if state.time_ms < bm_first_ho + 500 and not state.is_paused:
+            # We're near the start of the map. Good enough.
+            print(f"[live] clock near map start (time={state.time_ms:.0f}ms, first_ho={bm_first_ho:.0f})")
+            break
+        if time.perf_counter() - tfirst_wait > 60.0:
+            print(f"[live] no reset in 60s; proceeding at time={state.time_ms:.0f}")
+            break
+        last_time = state.time_ms
+        time.sleep(0.02)
 
     print(f"[live] clock live (time={state.time_ms:.0f}ms, pause={state.is_paused}, "
-          f"mode={ 'std' if state.is_playing else 'non-std'})")
+          f"mode={'std' if state.is_playing else 'non-std'})")
 
-    # Plan ALL presses once from the static HO list. ModelService.plan with a
-    # giant lookahead returns every clickable press.
+    # Latency compensation: planning takes real time (model forward per HO,
+    # 234 HOs at a few ms each = a second or more total). Snapshot the
+    # planning-start wall time so we can offset by elapsed wall-ms before
+    # submitting.
+    planning_start_wall = time.perf_counter()
+    planning_start_bt = state.time_ms
+
+    # Plan ALL presses once from the static HO list. ModelService.plan with
+    # lookahead=inf returns every remaining clickable press.
     decisions = model.plan(state, lookahead_ms=float("inf"))
-    print(f"[live] planned {len(decisions)} presses across the map")
+    planning_wall_ms = (time.perf_counter() - planning_start_wall) * 1000.0
+    print(f"[live] planned {len(decisions)} presses in {planning_wall_ms:.0f}ms wall")
+    if len(decisions) == 0:
+        print("[live] nothing to play -- clock may be past map end. exiting.")
+        sink.detach()
+        return 1
+
+    # Drop any decisions whose press_time is already in osu's past
+    # (planning took wall-ms; osu's clock moved during planning).
+    # Current osu time approximately = planning_start_bt + planning_wall_ms.
+    now_bt_est = planning_start_bt + planning_wall_ms
+    pre = len(decisions)
+    decisions = [d for d in decisions if d.press_time_ms > now_bt_est + 10.0]
+    if pre != len(decisions):
+        print(f"[live] dropped {pre - len(decisions)} decisions already past "
+              f"(now_est={now_bt_est:.0f}ms)")
+
     dispatcher.submit(decisions)
 
     # Tick loop: poll time, fire presses whose press_time_ms has been reached.
