@@ -178,7 +178,7 @@ def run_live(args, *, dry_run: bool):
         sink.attach()
     except Exception as e:
         err_str = str(e)
-        if "no active hook with 8 insns" in err_str and not dry_run:
+        if ("no multi-insn hook found" in err_str or "no active hook with 8 insns" in err_str) and not dry_run:
             # Auto-install the key_inject hook pair and retry.
             import subprocess
             key_inject = r"C:\Users\riley\projects\new-era\tools\key-inject\key_inject.exe"
