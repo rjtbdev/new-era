@@ -175,8 +175,25 @@ def run_live(args, *, dry_run: bool):
     try:
         sink.attach()
     except Exception as e:
-        print(f"[live] sink attach failed: {e}")
-        return 1
+        err_str = str(e)
+        if "no active hook with 8 insns" in err_str and not dry_run:
+            # Auto-install the key_inject hook pair and retry.
+            import subprocess
+            key_inject = r"C:\Users\riley\projects\new-era\tools\key-inject\key_inject.exe"
+            print(f"[live] key_inject hooks not installed; running `{key_inject} install`...")
+            r = subprocess.run([key_inject, "install"], capture_output=True, text=True, timeout=60)
+            print(r.stdout)
+            if r.returncode != 0:
+                print(f"[live] auto-install failed: {r.stderr}")
+                return 1
+            try:
+                sink.attach()
+            except Exception as e2:
+                print(f"[live] sink attach still failing after install: {e2}")
+                return 1
+        else:
+            print(f"[live] sink attach failed: {e}")
+            return 1
 
     model = ModelService(
         timing_ckpt=PROJECT / "models" / "timing_best.pt",
@@ -184,7 +201,7 @@ def run_live(args, *, dry_run: bool):
         device="cpu",
         rules=RuleConfig(seed=42),
     )
-    dispatcher = Dispatcher(sink)
+    dispatcher = Dispatcher(sink, press_lead_ms=args.press_lead_ms)
 
     print(f"[live] waiting for a CLOCK RESET (click Play in osu! now)...")
     # Watch for osu's `time` field to jump BACKWARD -- that's the song
@@ -216,6 +233,20 @@ def run_live(args, *, dry_run: bool):
 
     print(f"[live] clock live (time={state.time_ms:.0f}ms, pause={state.is_paused}, "
           f"mode={'std' if state.is_playing else 'non-std'})")
+
+    # Settle the time reader: osu's time field can briefly read a huge
+    # (negative-signed, uninitialized) value immediately after a reset.
+    # Wait until we see a sane value before planning.
+    bm_end_est = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
+    settle_start = time.perf_counter()
+    while time.perf_counter() - settle_start < 2.0:
+        s = reader.read()
+        if 0 <= s.time_ms <= bm_end_est and not s.is_paused:
+            state = s
+            break
+        time.sleep(0.05)
+    else:
+        print(f"[live] WARN: time field never settled in 2s; proceeding anyway")
 
     # Latency compensation: planning takes real time (model forward per HO,
     # 234 HOs at a few ms each = a second or more total). Snapshot the
@@ -252,6 +283,10 @@ def run_live(args, *, dry_run: bool):
     last_wall = time.perf_counter()
     start_bt = state.time_ms
 
+    last_sane_bt = state.time_ms
+    last_dbg_wall = time.perf_counter()
+    tick_count = 0
+    bm_end = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
     while True:
         wall = time.perf_counter()
         if wall - last_wall < tick_dt:
@@ -259,20 +294,38 @@ def run_live(args, *, dry_run: bool):
         last_wall = time.perf_counter()
 
         state = reader.read()
+        tick_count += 1
+
+        # SANITY: osu sometimes returns uninitialized time values
+        # (0xFFFFFFF? -> ~4B ms as unsigned). Also, any time way past
+        # the last HO is suspicious. Clamp/skip bad reads.
+        bt = state.time_ms
+        if bt > bm_end or bt < 0:
+            if args.verbose:
+                print(f"[live] SKIP bad time_ms={bt:.0f} (bm_end={bm_end:.0f}) "
+                      f"paused={state.is_paused}")
+            continue
 
         # Stop if osu! ends the map (play_mode changes) or user quits.
         if state.is_paused:
             if args.verbose:
-                print(f"[live] paused at {state.time_ms:.0f}ms; holding")
+                print(f"[live] paused at {bt:.0f}ms; holding")
             time.sleep(0.1)
             continue
 
-        dispatcher.tick(state.time_ms)
+        last_sane_bt = bt
+
+        # Periodic status line
+        if args.verbose and (time.perf_counter() - last_dbg_wall) > 1.0:
+            last_dbg_wall = time.perf_counter()
+            print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
+                  f"to_release={len(dispatcher._to_release)}  ticks={tick_count}")
+
+        dispatcher.tick(bt)
 
         # Simple exit: when we've been past all HOs for 2 seconds
         if (not dispatcher._pending and not dispatcher._to_release
-                and state.time_ms > start_bt + 2000):
-            # All planned presses fired; keep going for 2s in case of late ticks
+                and bt > start_bt + 2000):
             break
 
     # Cleanup: release any lingering CFG overrides.
@@ -304,6 +357,11 @@ def main():
     ap.add_argument("--plan-hz", type=float, default=30.0,
                     help="(mock only) how often to re-plan upcoming presses")
     ap.add_argument("--lookahead-ms", type=float, default=400.0)
+    ap.add_argument("--press-lead-ms", type=float, default=150.0,
+                    help="(live only) fire presses N ms earlier than planned "
+                         "to compensate for AoSink subprocess latency. "
+                         "Default 150ms is a starting guess; tune to match "
+                         "observed lag. 0 disables compensation.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

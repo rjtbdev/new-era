@@ -23,9 +23,23 @@ class _PendingRelease:
 
 
 class Dispatcher:
-    def __init__(self, sink: KeySink, *, default_hold_ms: float = 85.0):
+    def __init__(
+        self,
+        sink: KeySink,
+        *,
+        default_hold_ms: float = 85.0,
+        press_lead_ms: float = 0.0,
+    ):
+        """
+        press_lead_ms: fire presses N ms earlier than their press_time_ms.
+            Use this to compensate for AoSink latency (~100-200ms per press
+            due to subprocess spawn overhead). A value of ~150ms tends to
+            align the actual key-register event with the intended beatmap
+            time on the current setup.
+        """
         self.sink = sink
         self.default_hold_ms = default_hold_ms
+        self.press_lead_ms = press_lead_ms
         self._pending: List[PressDecision] = []       # waiting to fire a press
         self._to_release: List[_PendingRelease] = []  # waiting to fire a release
 
@@ -34,10 +48,11 @@ class Dispatcher:
         self._pending.sort(key=lambda d: d.press_time_ms)
 
     def tick(self, now_bt_ms: float) -> None:
-        # Fire any releases that are due
+        # Fire any releases that are due (compensated with the same lead so
+        # hold duration stays what the model asked for).
         kept_releases: List[_PendingRelease] = []
         for r in self._to_release:
-            if now_bt_ms >= r.release_t_ms:
+            if now_bt_ms >= r.release_t_ms - self.press_lead_ms:
                 self.sink.release(r.key)
             else:
                 kept_releases.append(r)
@@ -46,7 +61,7 @@ class Dispatcher:
         # Fire any presses that are due. Presses are time-sorted.
         fired = 0
         for d in self._pending:
-            if now_bt_ms >= d.press_time_ms:
+            if now_bt_ms >= d.press_time_ms - self.press_lead_ms:
                 self.sink.press(d.key)
                 # Use the decision's own hold_ms (set by ModelService: real
                 # slider duration for sliders, 85ms default for circles).
