@@ -354,14 +354,28 @@ def run_live(args, *, dry_run: bool):
         print("[live] FATAL: couldn't find key_inject hook B VA in status")
         return 1
 
+    # Use state.time_ms as a sanity upper bound for TimePoller's first
+    # sample. Any log entry whose a-value is > (current_osu_time +
+    # small_margin) is a pre-reset preview entry and must be discarded.
+    # Also gate against anything beyond map end.
+    sane_bt_cap = min(bm_end, float(state.time_ms) + 2000.0)
     hdp = HookDataPoller(
         time_va=time_hook_va,
         cursor_va=poller_cursor_va,
-        max_valid_bt=bm_end,
+        max_valid_bt=sane_bt_cap,
         drain_interval_s=0.03,
     )
-    pre_drained = hdp.drain_startup()
-    print(f"[live] startup: discarded {pre_drained} stale log entries")
+    # Drain stale entries. Repeat a few times with small delays so entries
+    # written during our drain-process are also caught before start().
+    pre_drained = 0
+    for _ in range(3):
+        n = hdp.drain_startup()
+        pre_drained += n
+        if n == 0:
+            break
+        time.sleep(0.05)
+    print(f"[live] startup: discarded {pre_drained} stale log entries "
+          f"(sane_bt_cap={sane_bt_cap:.0f})")
     hdp.start()
     print(f"[live] HookDataPoller started (time_va=0x{time_hook_va:X}, "
           f"cursor_va={'0x%X' % poller_cursor_va if poller_cursor_va else 'None'})")
@@ -378,11 +392,19 @@ def run_live(args, *, dry_run: bool):
         anchor_source = "state"
     else:
         tp_bt, tp_perf = hdp.latest_time()
-        anchor_perf = tp_perf
-        anchor_bt   = tp_bt
-        anchor_source = "HookDataPoller"
-        print(f"[live] first time sample: bt={tp_bt:.0f}ms "
-              f"(discarded {hdp.discarded_count()} bad)")
+        # Last-chance sanity: refuse to anchor to anything > state+margin.
+        if tp_bt > sane_bt_cap:
+            print(f"[live] WARN: TimePoller first sample {tp_bt:.0f} > cap {sane_bt_cap:.0f}; "
+                  f"falling back to state.time_ms={state.time_ms:.0f}")
+            anchor_perf = time.perf_counter()
+            anchor_bt   = float(state.time_ms)
+            anchor_source = "state"
+        else:
+            anchor_perf = tp_perf
+            anchor_bt   = tp_bt
+            anchor_source = "HookDataPoller"
+            print(f"[live] first time sample: bt={tp_bt:.0f}ms "
+                  f"(discarded {hdp.discarded_count()} bad)")
 
     # Build ho_getter and cursor_fn for the Dispatcher
     if args.cursor_gate and poller_cursor_va is not None:
