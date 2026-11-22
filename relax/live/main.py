@@ -492,7 +492,7 @@ def run_live(args, *, dry_run: bool):
                     # Find the next upcoming HO and show distance.
                     next_d = None
                     for d_ in dispatcher._pending[:1]:
-                        ho = ho_getter(d_.center_idx) if ho_getter else None
+                        ho = dispatcher.ho_getter(d_.center_idx) if dispatcher.ho_getter else None
                         if ho is not None:
                             hx, hy, r = ho
                             dist = ((xy[0]-hx)**2 + (xy[1]-hy)**2) ** 0.5
