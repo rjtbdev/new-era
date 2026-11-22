@@ -30,6 +30,7 @@ import argparse
 import pathlib
 import sys
 import time
+from typing import Optional
 
 import torch  # DLL init order on Windows
 
@@ -37,10 +38,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from live.ao_reader import AoReader, _HypercallError
 from live.dispatcher import Dispatcher
+from live.hook_data_poller import HookDataPoller
 from live.model_service import ModelService
 from live.mock_reader import MockReader
 from live.sink import AoSink, MockSink
-from live.time_poller import TimePoller
 from src.models.rules import RuleConfig
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
@@ -202,6 +203,52 @@ def run_live(args, *, dry_run: bool):
         device="cpu",
         rules=RuleConfig(seed=42),
     )
+
+    # -----------------------------------------------------------------
+    # Install/discover cursor_capture hook if cursor gating is enabled
+    # -----------------------------------------------------------------
+    cursor_va: Optional[int] = None
+    if args.cursor_gate:
+        import re as _re
+        import subprocess as _sp
+        cursor_tool = r"C:\Users\riley\projects\new-era\tools\cursor-capture\cursor_capture.exe"
+        hook_tool = r"C:\Users\riley\projects\ao\cli\hook_tool.exe"
+
+        # Try to find existing cursor_capture hook in status; if none, install.
+        def _find_cursor_hook():
+            r = _sp.run([hook_tool, "status"], capture_output=True, text=True, timeout=10)
+            # look for an active 4-insn hook (cursor_capture's script len = 4)
+            row_re = _re.compile(
+                r"^\s*(\d+)\s+(\d)\s+0x[0-9a-fA-F]+\s+0x([0-9a-fA-F]+)\s+\d+\s+(\d+)",
+                _re.M)
+            for m in row_re.finditer(r.stdout):
+                _slot, active, va_hex, insns = m.groups()
+                if int(active) == 1 and int(insns) == 4:
+                    return int(va_hex, 16)
+            return None
+
+        cursor_va = _find_cursor_hook()
+        if cursor_va is None:
+            print(f"[live] installing cursor_capture hook...")
+            r = _sp.run([cursor_tool, "install"], capture_output=True, text=True, timeout=60)
+            print(r.stdout)
+            if r.returncode != 0:
+                print(f"[live] cursor_capture install failed: {r.stderr}")
+                return 1
+            cursor_va = _find_cursor_hook()
+            if cursor_va is None:
+                print(f"[live] WARN: cursor_capture installed but not found in status; disabling gating")
+                args.cursor_gate = False
+        if cursor_va is not None:
+            print(f"[live] cursor_capture hook at va=0x{cursor_va:X}")
+
+    # -----------------------------------------------------------------
+    # Dispatcher: wire cursor_fn and ho_getter if gating
+    # -----------------------------------------------------------------
+    poller_cursor_va = cursor_va if args.cursor_gate else None
+
+    # Create dispatcher. If cursor gating is on, we'll re-create below with
+    # cursor_fn/ho_getter wired in (after we have the poller running).
     dispatcher = Dispatcher(sink, press_lead_ms=args.press_lead_ms)
 
     print(f"[live] waiting for a CLOCK RESET (click Play in osu! now)...")
@@ -278,52 +325,92 @@ def run_live(args, *, dry_run: bool):
 
     dispatcher.submit(decisions)
 
-    # ---- Tick loop with TimePoller anchor + wall-clock extrapolation ----
+    # ---- Tick loop with HookDataPoller anchor + wall-clock extrapolation ----
     #
-    # TimePoller runs in a background thread, draining the ph_log ring
-    # every 50ms. The key_inject hook B emits a log entry with the current
-    # osu time (as entry.a) on every GetKeyboardState call (observed ~1kHz).
-    # So the poller always has a very fresh (bt, perf) anchor pair.
-    #
-    # Main tick loop: extrapolate bt = anchor_bt + (perf_now - anchor_perf)
-    # * 1000 * speed_mult. Re-anchor whenever TimePoller has newer data.
-    # Zero per-tick HV shell-outs. Tick runs at the requested poll_hz
-    # (default 200Hz = 5ms).
+    # HookDataPoller drains the shared ph_log ring and splits entries by
+    # VA: key_inject hook B emits time, cursor_capture hook emits xy.
+    # Main tick loop: extrapolate bt from latest time anchor; read latest
+    # cursor on each tick for cursor-gating in Dispatcher.
     poll_hz = args.poll_hz
     tick_dt = 1.0 / poll_hz
     bm_end = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
     speed_mult = state.speed_mult
 
-    # Start the background time poller. max_valid_bt gates out garbage
-    # (uninitialized osu time bits, stale pre-reset entries).
-    time_poller = TimePoller(drain_interval_s=0.05, max_valid_bt=bm_end)
+    # Resolve key_inject hook B VA (where time is logged from) via hook_tool
+    # status — it's the 11-insn hook.
+    import subprocess as _sp, re as _re
+    _r = _sp.run([r"C:\Users\riley\projects\ao\cli\hook_tool.exe", "status"],
+                 capture_output=True, text=True, timeout=10)
+    _row_re = _re.compile(
+        r"^\s*(\d+)\s+(\d)\s+0x[0-9a-fA-F]+\s+0x([0-9a-fA-F]+)\s+\d+\s+(\d+)",
+        _re.M)
+    time_hook_va = None
+    for _m in _row_re.finditer(_r.stdout):
+        _slot, active, va_hex, insns = _m.groups()
+        if int(active) == 1 and int(insns) >= 8:
+            time_hook_va = int(va_hex, 16)
+            break
+    if time_hook_va is None:
+        print("[live] FATAL: couldn't find key_inject hook B VA in status")
+        return 1
 
-    # CRITICAL: drain ring BEFORE starting the poller thread. osu writes
-    # to the log at ~1kHz; without this, we'd anchor on stale pre-reset
-    # entries (e.g. preview-time 36402ms from before you clicked Play).
-    pre_drained = time_poller.drain_startup()
+    hdp = HookDataPoller(
+        time_va=time_hook_va,
+        cursor_va=poller_cursor_va,
+        max_valid_bt=bm_end,
+        drain_interval_s=0.03,
+    )
+    pre_drained = hdp.drain_startup()
     print(f"[live] startup: discarded {pre_drained} stale log entries")
+    hdp.start()
+    print(f"[live] HookDataPoller started (time_va=0x{time_hook_va:X}, "
+          f"cursor_va={'0x%X' % poller_cursor_va if poller_cursor_va else 'None'})")
 
-    time_poller.start()
-    print(f"[live] TimePoller started (draining ph_log every 50ms, max_bt={bm_end:.0f})")
-
-    # Wait up to 2s for first sane sample
+    # Wait for first sane time sample
     tp_wait_start = time.perf_counter()
-    while time_poller.latest_time_ms() is None and time.perf_counter() - tp_wait_start < 2.0:
+    while hdp.latest_time_ms() is None and time.perf_counter() - tp_wait_start < 2.0:
         time.sleep(0.02)
-    first_tp = time_poller.latest_time_ms()
+    first_tp = hdp.latest_time_ms()
     if first_tp is None:
-        print("[live] WARN: TimePoller got no sane samples in 2s. Falling back to state.")
+        print("[live] WARN: HookDataPoller got no sane time samples in 2s. Falling back to state.")
         anchor_perf = time.perf_counter()
         anchor_bt   = float(state.time_ms)
         anchor_source = "state"
     else:
-        tp_bt, tp_perf = time_poller.latest()
+        tp_bt, tp_perf = hdp.latest_time()
         anchor_perf = tp_perf
         anchor_bt   = tp_bt
-        anchor_source = "TimePoller"
-        print(f"[live] first TimePoller sample: bt={tp_bt:.0f}ms "
-              f"(discarded {time_poller.discarded_count()} bad)")
+        anchor_source = "HookDataPoller"
+        print(f"[live] first time sample: bt={tp_bt:.0f}ms "
+              f"(discarded {hdp.discarded_count()} bad)")
+
+    # Build ho_getter and cursor_fn for the Dispatcher
+    if args.cursor_gate and poller_cursor_va is not None:
+        from src.data.features import _circle_radius_px
+        # CS from session_fields (hardcoded 4.0 under use_hom; OK for now)
+        cs = reader._session_fields.get("cs", 4.0)
+        circle_radius = _circle_radius_px(cs, args.mods)
+        # Build (x, y, r) lookup by HO index
+        ho_pos = {h.idx: (h.x, h.y, circle_radius) for h in reader._hit_objects}
+
+        def _ho_getter(center_idx: int):
+            return ho_pos.get(center_idx)
+        def _cursor_fn():
+            xy, _ = hdp.latest_cursor()
+            return xy
+        # Replace the plain Dispatcher with a cursor-aware one
+        dispatcher = Dispatcher(
+            sink,
+            press_lead_ms=args.press_lead_ms,
+            cursor_fn=_cursor_fn,
+            ho_getter=_ho_getter,
+            cursor_gate_window_ms=args.cursor_gate_window_ms,
+            cursor_radius_mult=args.cursor_radius_mult,
+        )
+        # re-submit to the new dispatcher
+        dispatcher.submit(decisions)
+        print(f"[live] cursor gating ENABLED: window=±{args.cursor_gate_window_ms:.0f}ms, "
+              f"radius_mult={args.cursor_radius_mult:.2f}, circle_r={circle_radius:.1f}px")
 
     last_anchor_tp_bt = anchor_bt
     start_bt = anchor_bt
@@ -420,6 +507,19 @@ def main():
                          "With TimePoller the time anchor is kHz-fresh and "
                          "AoSink per-press latency is the only cost (~30-50ms). "
                          "Tune to taste; 0-50ms is the expected range.")
+    ap.add_argument("--cursor-gate", action="store_true",
+                    help="(live only) gate each press on cursor-is-on-HO. "
+                         "Fires as soon as cursor enters the circle within the "
+                         "gate window around the scheduled press_time. Requires "
+                         "cursor_capture hook; auto-installs if missing.")
+    ap.add_argument("--cursor-gate-window-ms", type=float, default=60.0,
+                    help="(live only) half-width of cursor gate window around "
+                         "press_time. Within this window we wait for cursor; "
+                         "outside we fire anyway. Default 60ms.")
+    ap.add_argument("--cursor-radius-mult", type=float, default=1.0,
+                    help="(live only) multiplier on circle radius for the "
+                         "'cursor on HO' check. 1.0 = exact radius; 1.5 = more "
+                         "forgiving. Default 1.0.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
