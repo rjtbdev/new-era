@@ -426,8 +426,8 @@ def run_live(args, *, dry_run: bool):
         now_perf = time.perf_counter()
         tick_count += 1
 
-        # Check TimePoller for a newer anchor
-        tp_bt, tp_perf = time_poller.latest()
+        # Check HookDataPoller for a newer anchor
+        tp_bt, tp_perf = hdp.latest_time()
         if tp_bt is not None and tp_bt != last_anchor_tp_bt:
             # New sample. Re-anchor if monotonic (ignore anomalies).
             if tp_bt >= last_anchor_tp_bt - 100:  # allow small jitter
@@ -465,7 +465,8 @@ def run_live(args, *, dry_run: bool):
                 lag_str = ""
             print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
                   f"to_release={len(dispatcher._to_release)}  ticks={tick_count}  "
-                  f"drained={time_poller.drain_count()}  src={anchor_source}{lag_str}")
+                  f"time_n={hdp.time_count()}  cursor_n={hdp.cursor_count()}  "
+                  f"src={anchor_source}{lag_str}")
 
         dispatcher.tick(bt)
 
@@ -473,9 +474,9 @@ def run_live(args, *, dry_run: bool):
                 and bt > start_bt + 2000):
             break
 
-    time_poller.stop()
+    hdp.stop()
     sink.detach()
-    print(f"[live] done. ticks={tick_count} drained={time_poller.drain_count()}")
+    print(f"[live] done. ticks={tick_count} time_n={hdp.time_count()} cursor_n={hdp.cursor_count()}")
     return 0
 
 
