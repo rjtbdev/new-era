@@ -131,16 +131,22 @@ def run_mock(args):
 
 
 def run_live(args, *, dry_run: bool):
-    """AoReader + AoSink. Map parsed from disk, live osu! clock drives timing.
+    """AoReader + AoSink. HOs come from live HOM (if --use-hom) or .osu file.
 
-    Does NOT re-plan every tick (unlike mock); the model plans once from the
-    static HO list, dispatcher fires presses when osu!'s clock reaches each
-    one. Simpler + lower latency than the mock path. Re-planning per tick
-    is unnecessary when HOs are known up front.
+    Does NOT re-plan every tick; the model plans once from the HO list,
+    dispatcher fires presses when osu!'s clock reaches each one.
     """
-    osu_path = PROJECT / "data" / "raw" / "beatmaps" / f"{args.bid}.osu"
-    if not osu_path.exists():
-        print(f"[live] missing {osu_path}")
+    osu_path = None
+    if args.bid is not None:
+        osu_path = PROJECT / "data" / "raw" / "beatmaps" / f"{args.bid}.osu"
+        if not osu_path.exists():
+            if not args.use_hom:
+                print(f"[live] missing {osu_path} and --use-hom not set")
+                return 1
+            osu_path = None  # fall back to HOM-only
+
+    if osu_path is None and not args.use_hom:
+        print("[live] either --bid (with map file present) or --use-hom required")
         return 1
 
     reader = AoReader(
@@ -149,14 +155,20 @@ def run_live(args, *, dry_run: bool):
         mods=args.mods,
         beatmap_id=args.bid,
         player_id=args.user,
+        use_hom=args.use_hom,
     )
-    print(f"[live] attaching AoReader to osu!.exe...")
+    print(f"[live] attaching AoReader to osu!.exe "
+          f"(use_hom={args.use_hom}, osu_path={'.osu' if osu_path else 'none'})...")
     try:
         reader.attach()
     except _HypercallError as e:
         print(f"[live] attach failed: {e}")
+        if args.use_hom:
+            print("[live] HINT: --use-hom requires osu! to already be IN a map.")
         return 1
     print(f"[live] attached. VAs: {reader.resolved_vas()}")
+    print(f"[live] HOs loaded: {len(reader._hit_objects)} "
+          f"(source: {'HOM' if args.use_hom else '.osu file'})")
 
     sink = AoSink(verbose=args.verbose, dry_run=dry_run)
     print(f"[live] binding AoSink (dry_run={dry_run})...")
@@ -276,9 +288,13 @@ def main():
     mode.add_argument("--live", action="store_true", help="AoReader + AoSink (real osu!)")
     mode.add_argument("--dry-live", action="store_true",
                       help="AoReader + AoSink in dry-run mode (logs CFG writes, doesn't apply)")
-    ap.add_argument("--bid", type=int, required=True)
+    ap.add_argument("--bid", type=int, default=None,
+                    help="beatmap id; optional if --use-hom (HOs come from memory)")
     ap.add_argument("--user", type=int, required=True)
     ap.add_argument("--mods", type=int, default=0)
+    ap.add_argument("--use-hom", action="store_true",
+                    help="(live only) read hit objects from osu!'s live HOM; "
+                         "no .osu file required. osu! must be IN a map at attach time.")
     ap.add_argument("--speed", type=float, default=1.0,
                     help="(mock only) run faster than realtime")
     ap.add_argument("--start-offset-ms", type=float, default=-1000.0,
@@ -292,6 +308,8 @@ def main():
     args = ap.parse_args()
 
     if args.mock:
+        if args.bid is None:
+            ap.error("--mock requires --bid")
         run_mock(args)
     elif args.dry_live:
         sys.exit(run_live(args, dry_run=True))

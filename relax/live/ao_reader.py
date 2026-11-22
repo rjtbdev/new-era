@@ -26,6 +26,49 @@ from typing import List, Optional
 from .osu_reader import GameState, HitObject
 
 
+# --- HitObjectManager (HOM) layout, discovered live 2026-11-21 ---
+#
+# Walk: running_gamemode -> GameMode_Player -> HOM -> _items[] -> HO[i]
+#
+# GameMode_Player + 0x44 = HOM object pointer
+# HOM + 0x90           = int32 count         (how many HOs on this map)
+# HOM + 0xB8           = ptr to _items[]     (.NET T[] backing array)
+# _items + 0x04        = int32 capacity      (not count; may be > count)
+# _items + 0x08 + i*4  = HitObject pointer i
+#
+# HitObject layout:
+#   +0x10  int32 start_t_ms
+#   +0x14  int32 end_t_ms   (equal to start_t for circles; differs for sliders/spinners)
+#   +0x18  int32 type       (bit 0=circle, bit 1=slider, bit 2=new_combo, bit 3=spinner)
+#   +0x38  float32 x        (osu field 0..512)
+#   +0x3C  float32 y        (osu field 0..384)
+GM_OFF_HOM        = 0x44
+HOM_OFF_COUNT     = 0x90
+HOM_OFF_ITEMS     = 0xB8
+ARR_OFF_LENGTH    = 0x04
+ARR_OFF_DATA      = 0x08
+HO_OFF_START_T    = 0x10
+HO_OFF_END_T      = 0x14
+HO_OFF_TYPE       = 0x18
+HO_OFF_X          = 0x38
+HO_OFF_Y          = 0x3C
+
+# osu HO type bits (matches .osu-file spec)
+HO_TYPE_CIRCLE    = 0x01
+HO_TYPE_SLIDER    = 0x02
+HO_TYPE_NEWCOMBO  = 0x04
+HO_TYPE_SPINNER   = 0x08
+
+
+def _ho_type_to_kind(type_byte: int) -> str:
+    """Decode the raw type byte to our kind string."""
+    if type_byte & HO_TYPE_SPINNER:
+        return "spinner"
+    if type_byte & HO_TYPE_SLIDER:
+        return "slider"
+    return "circle"
+
+
 HOOK_TOOL_ENV = "AO_HOOK_TOOL"
 DEFAULT_HOOK_TOOL = r"C:\Users\riley\projects\ao\cli\hook_tool.exe"
 
@@ -120,17 +163,31 @@ class AoReader:
         mods: int = 0,
         beatmap_id: Optional[int] = None,
         player_id: Optional[int] = None,
+        use_hom: bool = False,
     ):
+        """
+        Args:
+            osu_path: if given, HOs come from this .osu file (parse once).
+            use_hom:  if True, HOs come from osu!'s live HOM on each attach.
+                      Requires osu! to be IN a map at attach time. Does NOT
+                      require osu_path. Session-level defaults (CS/OD/etc.)
+                      still need the .osu for now (not read from memory yet).
+        """
         self.process_name = process_name
         self.osu_path = pathlib.Path(osu_path) if osu_path else None
         self.mods = mods
         self.beatmap_id = beatmap_id
         self.player_id = player_id
+        self.use_hom = use_hom
 
         self._cr3: Optional[int] = None
         self._hit_objects: List[HitObject] = []
         self._session_fields: dict = {}
         self._va: dict[str, int] = {}
+        # HOM walk cache (set on attach when use_hom=True)
+        self._hom_ptr: Optional[int] = None
+        self._hom_items_ptr: Optional[int] = None
+        self._hom_count: int = 0
 
     # --- Hypercall wrappers (shell out to hook_tool.exe) ---
 
@@ -230,6 +287,33 @@ class AoReader:
                 "speed_mult": _speed_mult(self.mods),
             }
 
+        if self.use_hom:
+            # Walk to HOM via running_gamemode. osu! must be IN a map now.
+            self._hom_attach()
+            hos = self._read_hit_objects_from_hom()
+            if self.osu_path is None:
+                # No .osu file; use HOM entirely. Session fields fall back
+                # to osu default CS/OD values; will be approximate until we
+                # also pull those from memory.
+                self._hit_objects = hos
+                # Defaults: CS=4, OD=8 (common osu!std ranked values).
+                # Keep hard-coded for now; TODO sig/offset for live CS/OD.
+                cs, od = 4.0, 8.0
+                eod = od  # mods=0 assumption; apply speed mods later
+                self._session_fields = {
+                    "cs": cs, "od": od,
+                    "hw300": 80.0 - 6.0 * eod,
+                    "hw100": 140.0 - 8.0 * eod,
+                    "hw50":  200.0 - 10.0 * eod,
+                    "circle_radius_px": 54.4 - 4.48 * cs,  # osu std formula
+                    "speed_mult": 1.0,
+                }
+            else:
+                # .osu was also parsed; compare against HOM as a sanity check.
+                if len(hos) != len(self._hit_objects):
+                    print(f"[AoReader] HOM count ({len(hos)}) != .osu count "
+                          f"({len(self._hit_objects)}); using .osu-parsed HOs.")
+
     def read(self) -> GameState:
         if self._cr3 is None:
             raise _HypercallError("attach() first")
@@ -252,6 +336,78 @@ class AoReader:
     def detach(self) -> None:
         self._cr3 = None
         self._va.clear()
+        self._hom_ptr = None
+        self._hom_items_ptr = None
+        self._hom_count = 0
+
+    # --- HitObjectManager (HOM) walk ---
+
+    def _hom_attach(self) -> None:
+        """Resolve GameMode_Player -> HOM -> _items. Fails if no live map."""
+        if "running_gamemode" not in self._va:
+            raise _HypercallError("running_gamemode not resolved; attach() first")
+        gm_ptr = self._read_u32(self._va["running_gamemode"])
+        if gm_ptr == 0:
+            raise _HypercallError(
+                "GameMode_Player ptr is NULL — osu! is not in a map. "
+                "Start a map first, then call attach() with use_hom=True.")
+        hom_ptr = self._read_u32(gm_ptr + GM_OFF_HOM)
+        if hom_ptr == 0:
+            raise _HypercallError(f"HOM ptr at GM+0x{GM_OFF_HOM:X} is NULL")
+        items_ptr = self._read_u32(hom_ptr + HOM_OFF_ITEMS)
+        if items_ptr == 0:
+            raise _HypercallError(f"HOM._items ptr at HOM+0x{HOM_OFF_ITEMS:X} is NULL")
+        count = self._read_u32(hom_ptr + HOM_OFF_COUNT)
+        self._hom_ptr = hom_ptr
+        self._hom_items_ptr = items_ptr
+        self._hom_count = count
+
+    def _read_hit_objects_from_hom(self) -> List[HitObject]:
+        """Iterate the HOM backing array, read each HO's fields."""
+        if self._hom_items_ptr is None:
+            raise _HypercallError("_hom_attach() first")
+        out: List[HitObject] = []
+        # Bulk-read all HO pointers in one call for speed:
+        # items[0..count] = _items + 8, 4 bytes each
+        ptrs_bytes = self._hc_read_bytes(
+            self._hom_items_ptr + ARR_OFF_DATA, self._hom_count * 4
+        )
+        for i in range(self._hom_count):
+            ho_ptr = int.from_bytes(ptrs_bytes[i*4:(i+1)*4], "little")
+            if ho_ptr == 0:
+                continue
+            # Each HO: read a 64-byte window covering +0x10..+0x3F
+            # (start, end, type at +0x10..+0x1B; x,y at +0x38..+0x3F).
+            win = self._hc_read_bytes(ho_ptr + HO_OFF_START_T, 0x30)
+            start_t  = int.from_bytes(win[0:4], "little")
+            end_t    = int.from_bytes(win[4:8], "little")
+            type_    = int.from_bytes(win[8:12], "little")
+            # +0x38 is 40 bytes past start_t base (we started reading at
+            # HO_OFF_START_T=0x10; x is at 0x38 so offset 0x28 in `win`)
+            x = struct.unpack("<f", win[0x28:0x2C])[0]
+            y = struct.unpack("<f", win[0x2C:0x30])[0]
+            kind = _ho_type_to_kind(type_)
+            new_combo = bool(type_ & HO_TYPE_NEWCOMBO)
+            out.append(HitObject(
+                idx=i,
+                t=float(start_t),
+                x=float(x),
+                y=float(y),
+                kind=kind,
+                new_combo=new_combo,
+                end_t=float(end_t) if end_t != start_t else None,
+            ))
+        return out
+
+    def read_hit_objects(self) -> List[HitObject]:
+        """Return the currently-loaded HOs from the live HOM.
+
+        Requires attach() was called with use_hom=True. Re-walks the HOM
+        pointers on every call (map-change-safe).
+        """
+        self._hom_attach()
+        self._hit_objects = self._read_hit_objects_from_hom()
+        return list(self._hit_objects)
 
     # --- Typed primitive reads (go through hook_tool read) ---
     def _read_u8(self, va: int) -> int:
