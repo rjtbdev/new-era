@@ -114,8 +114,8 @@ class Dispatcher:
 
             fire = False
 
-            if gated and cursor_xy is not None and now_bt_ms < gate_late:
-                # Try cursor gating within the window.
+            if gated and cursor_xy is not None:
+                # Cursor-gated path. Check "cursor on circle" each tick.
                 ho = self.ho_getter(d.center_idx)
                 if ho is not None:
                     hx, hy, radius = ho
@@ -124,24 +124,23 @@ class Dispatcher:
                     dist_sq = dx * dx + dy * dy
                     r = radius * self.cursor_radius_mult
                     if dist_sq <= r * r:
-                        fire = True  # cursor on circle -> fire now
+                        # Cursor is on the circle. Fire IF we're also within
+                        # the gate window (don't fire super early because
+                        # cursor happens to pass over the HO).
+                        if now_bt_ms >= gate_early:
+                            fire = True
+                        # else: wait — too early even if cursor arrived
                     elif now_bt_ms >= gate_late:
-                        fire = True  # out of time -> fire anyway
-                    # else: wait another tick
-                elif now_bt_ms >= schedule_fire_time:
+                        # Late deadline: fire anyway to avoid miss.
+                        fire = True
+                    # else: cursor not on HO, still within window -> wait
+                else:
                     # No HO data; fall back to schedule.
-                    fire = True
+                    if now_bt_ms >= schedule_fire_time:
+                        fire = True
             else:
-                # Not gated, OR past the late-end of window, OR no cursor.
-                # Use schedule.
-                if now_bt_ms >= gate_late:
-                    # Past late-end: fire regardless (don't miss).
-                    fire = True
-                elif not gated and now_bt_ms >= schedule_fire_time:
-                    # Not gated: fire by schedule.
-                    fire = True
-                elif gated and cursor_xy is None and now_bt_ms >= schedule_fire_time:
-                    # Gated mode but no cursor data: fall back to schedule.
+                # Not gated, or no cursor data available. Use schedule.
+                if now_bt_ms >= schedule_fire_time:
                     fire = True
 
             if fire:
