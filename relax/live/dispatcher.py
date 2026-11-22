@@ -42,6 +42,7 @@ class Dispatcher:
         self.press_lead_ms = press_lead_ms
         self._pending: List[PressDecision] = []       # waiting to fire a press
         self._to_release: List[_PendingRelease] = []  # waiting to fire a release
+        self._press_deltas: List[float] = []          # now_bt - press_time for each fire
 
     def submit(self, decisions: List[PressDecision]) -> None:
         self._pending.extend(decisions)
@@ -62,9 +63,12 @@ class Dispatcher:
         fired = 0
         for d in self._pending:
             if now_bt_ms >= d.press_time_ms - self.press_lead_ms:
+                delta = now_bt_ms - d.press_time_ms
+                # Track rolling stats so we can report real timing error.
+                self._press_deltas.append(delta)
+                if len(self._press_deltas) > 500:
+                    self._press_deltas = self._press_deltas[-500:]
                 self.sink.press(d.key)
-                # Use the decision's own hold_ms (set by ModelService: real
-                # slider duration for sliders, 85ms default for circles).
                 hold = getattr(d, "hold_ms", self.default_hold_ms)
                 self._to_release.append(_PendingRelease(
                     release_t_ms=d.press_time_ms + hold,

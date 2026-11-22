@@ -367,9 +367,18 @@ def run_live(args, *, dry_run: bool):
         # Periodic status line
         if args.verbose and (now_perf - last_dbg_wall) > 1.0:
             last_dbg_wall = now_perf
+            deltas = dispatcher._press_deltas
+            if deltas:
+                import statistics
+                recent = deltas[-100:]
+                mean_d = statistics.mean(recent)
+                std_d = statistics.stdev(recent) if len(recent) > 1 else 0.0
+                lag_str = f" lag_mean={mean_d:+.0f}ms std={std_d:.0f}ms"
+            else:
+                lag_str = ""
             print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
                   f"to_release={len(dispatcher._to_release)}  ticks={tick_count}  "
-                  f"drained={time_poller.drain_count()}  src={anchor_source}")
+                  f"drained={time_poller.drain_count()}  src={anchor_source}{lag_str}")
 
         dispatcher.tick(bt)
 
