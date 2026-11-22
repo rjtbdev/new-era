@@ -104,11 +104,14 @@ class AoSink:
                 continue
             candidates.append((int(slot), int(va_hex, 16), int(insn_count)))
 
-        # Hook B has 8 instructions; hook A has 1.
-        writers = [c for c in candidates if c[2] == 8]
+        # Hook B is the write hook; hook A is a 1-insn passthrough.
+        # B's size changed over time as we added features (8 -> 11 with
+        # time-logging). Find it as "any active hook that isn't the 1-insn
+        # passthrough".
+        writers = [c for c in candidates if c[2] > 1]
         if not writers:
             raise RuntimeError(
-                "AoSink: no active hook with 8 insns (hook B). "
+                "AoSink: no multi-insn hook found (hook B). "
                 "Run `key_inject install` first.\n"
                 f"hook_tool status output:\n{out.stdout}"
             )

@@ -43,14 +43,20 @@ class TimePoller:
     of a (value, timestamp) tuple protected by a lock.
     """
 
-    def __init__(self, drain_interval_s: float = 0.05):
+    def __init__(self, drain_interval_s: float = 0.05,
+                 max_valid_bt: float = 10_000_000.0):
+        """max_valid_bt: ignore log entries whose a-field is larger. Guards
+        against osu's uninitialized (0xFFFFFF..) time reads and stale
+        pre-reset entries."""
         self._drain_interval = drain_interval_s
+        self._max_valid_bt = max_valid_bt
         self._lock = threading.Lock()
         self._latest_bt: Optional[float] = None
         self._latest_perf: Optional[float] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._drain_count = 0
+        self._discarded = 0
 
     def start(self) -> None:
         if self._running:
@@ -77,6 +83,18 @@ class TimePoller:
     def drain_count(self) -> int:
         return self._drain_count
 
+    def discarded_count(self) -> int:
+        return self._discarded
+
+    def drain_startup(self) -> int:
+        """Discard all entries currently in the ring. Call once right after
+        detecting osu's clock reset so we don't anchor on stale data."""
+        p = subprocess.run(
+            [HOOK_TOOL, "log"], capture_output=True, text=True, timeout=2.0,
+        )
+        n = len(self._LOG_LINE_RE.findall(p.stdout))
+        return n
+
     # --- private ---
 
     # hook_tool `log` output per row (after header):
@@ -102,12 +120,16 @@ class TimePoller:
         matches = list(self._LOG_LINE_RE.finditer(p.stdout))
         if not matches:
             return None
-        last = matches[-1]
-        # Groups: 1=cr3, 2=va, 3=a, 4=b. `a` is the osu time (we set it that
-        # way in the hook's PH_LOG). Fits in uint32; mask off.
-        a_val = int(last.group(3), 16)
         self._drain_count += len(matches)
-        return float(a_val & 0xFFFFFFFF)
+        # Walk matches newest-to-oldest, return the first one that passes
+        # the sanity filter. Discard anything huge (uninitialized osu time
+        # bits, e.g. 0xFFFFFFF?).
+        for m in reversed(matches):
+            a_val = int(m.group(3), 16) & 0xFFFFFFFF
+            if 0 <= a_val <= self._max_valid_bt:
+                return float(a_val)
+            self._discarded += 1
+        return None
 
     def _loop(self) -> None:
         while self._running:

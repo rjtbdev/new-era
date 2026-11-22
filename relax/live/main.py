@@ -294,19 +294,26 @@ def run_live(args, *, dry_run: bool):
     bm_end = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
     speed_mult = state.speed_mult
 
-    # Start the background time poller
-    time_poller = TimePoller(drain_interval_s=0.05)
-    time_poller.start()
-    print(f"[live] TimePoller started (draining ph_log every 50ms)")
+    # Start the background time poller. max_valid_bt gates out garbage
+    # (uninitialized osu time bits, stale pre-reset entries).
+    time_poller = TimePoller(drain_interval_s=0.05, max_valid_bt=bm_end)
 
-    # Wait up to 1s for first sample
+    # CRITICAL: drain ring BEFORE starting the poller thread. osu writes
+    # to the log at ~1kHz; without this, we'd anchor on stale pre-reset
+    # entries (e.g. preview-time 36402ms from before you clicked Play).
+    pre_drained = time_poller.drain_startup()
+    print(f"[live] startup: discarded {pre_drained} stale log entries")
+
+    time_poller.start()
+    print(f"[live] TimePoller started (draining ph_log every 50ms, max_bt={bm_end:.0f})")
+
+    # Wait up to 2s for first sane sample
     tp_wait_start = time.perf_counter()
-    while time_poller.latest_time_ms() is None and time.perf_counter() - tp_wait_start < 1.0:
+    while time_poller.latest_time_ms() is None and time.perf_counter() - tp_wait_start < 2.0:
         time.sleep(0.02)
     first_tp = time_poller.latest_time_ms()
     if first_tp is None:
-        print("[live] WARN: TimePoller got no samples in 1s. Is key_inject hook "
-              "installed with the time-logging variant? Falling back to initial state.")
+        print("[live] WARN: TimePoller got no sane samples in 2s. Falling back to state.")
         anchor_perf = time.perf_counter()
         anchor_bt   = float(state.time_ms)
         anchor_source = "state"
@@ -315,7 +322,8 @@ def run_live(args, *, dry_run: bool):
         anchor_perf = tp_perf
         anchor_bt   = tp_bt
         anchor_source = "TimePoller"
-        print(f"[live] first TimePoller sample: bt={tp_bt:.0f}ms")
+        print(f"[live] first TimePoller sample: bt={tp_bt:.0f}ms "
+              f"(discarded {time_poller.discarded_count()} bad)")
 
     last_anchor_tp_bt = anchor_bt
     start_bt = anchor_bt
@@ -342,10 +350,18 @@ def run_live(args, *, dry_run: bool):
 
         bt = anchor_bt + (now_perf - anchor_perf) * 1000.0 * speed_mult
 
-        # Sanity clamp (shouldn't happen with poller but defensive)
+        # Sanity clamp (shouldn't happen with poller but defensive).
+        # Also: if the anchor itself is garbage (shouldn't happen since
+        # TimePoller filters, but safety-net), treat as bad.
         if bt > bm_end or bt < 0:
-            if args.verbose:
-                print(f"[live] skip bad bt={bt:.0f}")
+            # Reset anchor to a safe value to prevent cascade of bad bt's.
+            # Use the planning_start_bt (osu clock at plan time) as a floor.
+            if anchor_bt > bm_end or anchor_bt < 0:
+                anchor_perf = now_perf
+                anchor_bt   = planning_start_bt
+                if args.verbose:
+                    print(f"[live] RESET anchor to planning_start_bt={planning_start_bt:.0f} "
+                          f"(was garbage: {anchor_bt:.0f})")
             continue
 
         # Periodic status line
