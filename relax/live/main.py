@@ -485,10 +485,26 @@ def run_live(args, *, dry_run: bool):
                 lag_str = f" lag_mean={mean_d:+.0f}ms std={std_d:.0f}ms"
             else:
                 lag_str = ""
-            print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
-                  f"to_release={len(dispatcher._to_release)}  ticks={tick_count}  "
-                  f"time_n={hdp.time_count()}  cursor_n={hdp.cursor_count()}  "
-                  f"src={anchor_source}{lag_str}")
+            cur_str = ""
+            if args.cursor_gate:
+                xy, _ = hdp.latest_cursor()
+                if xy is not None:
+                    # Find the next upcoming HO and show distance.
+                    next_d = None
+                    for d_ in dispatcher._pending[:1]:
+                        ho = ho_getter(d_.center_idx) if ho_getter else None
+                        if ho is not None:
+                            hx, hy, r = ho
+                            dist = ((xy[0]-hx)**2 + (xy[1]-hy)**2) ** 0.5
+                            next_d = (d_.press_time_ms - bt, dist, r)
+                    if next_d:
+                        t_until, dist, r = next_d
+                        cur_str = f"  cur=({xy[0]:.0f},{xy[1]:.0f})  next_in={t_until:+.0f}ms  dist={dist:.0f}/{r:.0f}px"
+                    else:
+                        cur_str = f"  cur=({xy[0]:.0f},{xy[1]:.0f})"
+            print(f"[live] t={bt:>6.0f}ms  pend={len(dispatcher._pending)}  "
+                  f"rel={len(dispatcher._to_release)}  tn={hdp.time_count()}  "
+                  f"cn={hdp.cursor_count()}{lag_str}{cur_str}")
 
         dispatcher.tick(bt)
 
