@@ -277,60 +277,88 @@ def run_live(args, *, dry_run: bool):
 
     dispatcher.submit(decisions)
 
-    # Tick loop: poll time, fire presses whose press_time_ms has been reached.
+    # ---- Tick loop with local wall-clock extrapolation ----
+    #
+    # Problem with per-tick reader.read(): each call spawns 3 subprocess
+    # (time/is_paused/play_mode) at ~50-80ms each → effective 2-3 Hz loop,
+    # massive jitter, presses fire way late or in bursts. The
+    # press_lead_ms knob was a band-aid for this.
+    #
+    # Fix: osu's time field is a monotonic ms counter advancing at wall
+    # rate (speed_mult 1.0 nomod, 1.5 DT, 0.75 HT). Between actual reads,
+    # extrapolate: now_bt = anchor_bt + (perf - anchor_perf)*1000*speed.
+    # Re-anchor every RESYNC_INTERVAL by reading real osu time & checking
+    # drift. This makes the tick loop pure-Python at microsecond
+    # granularity; only the resync hits the HV.
     poll_hz = args.poll_hz
     tick_dt = 1.0 / poll_hz
-    last_wall = time.perf_counter()
-    start_bt = state.time_ms
-
-    last_sane_bt = state.time_ms
-    last_dbg_wall = time.perf_counter()
-    tick_count = 0
+    RESYNC_INTERVAL_S = 0.5  # re-read osu time every 500ms
+    DRIFT_WARN_MS    = 50.0  # log if extrapolation drifts this far from real
     bm_end = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
+    speed_mult = state.speed_mult  # 1.0 / 1.5 / 0.75 depending on mods
+
+    # Anchor: the pair (wall_time, osu_time) we're extrapolating from.
+    anchor_perf = time.perf_counter()
+    anchor_bt   = float(state.time_ms)
+    last_resync_perf = anchor_perf
+    start_bt = anchor_bt
+    tick_count = 0
+    last_dbg_wall = anchor_perf
+
     while True:
         wall = time.perf_counter()
-        if wall - last_wall < tick_dt:
-            time.sleep(max(0, tick_dt - (wall - last_wall)))
-        last_wall = time.perf_counter()
+        sleep_dt = tick_dt - (wall - anchor_perf) % tick_dt
+        if sleep_dt > 0:
+            time.sleep(sleep_dt)
 
-        state = reader.read()
+        now_perf = time.perf_counter()
+        # Extrapolate osu beatmap time from the last anchor
+        bt = anchor_bt + (now_perf - anchor_perf) * 1000.0 * speed_mult
         tick_count += 1
 
-        # SANITY: osu sometimes returns uninitialized time values
-        # (0xFFFFFFF? -> ~4B ms as unsigned). Also, any time way past
-        # the last HO is suspicious. Clamp/skip bad reads.
-        bt = state.time_ms
-        if bt > bm_end or bt < 0:
-            if args.verbose:
-                print(f"[live] SKIP bad time_ms={bt:.0f} (bm_end={bm_end:.0f}) "
-                      f"paused={state.is_paused}")
-            continue
+        # Periodic resync: compare extrapolation to real osu time; re-anchor
+        if now_perf - last_resync_perf >= RESYNC_INTERVAL_S:
+            last_resync_perf = now_perf
+            state = reader.read()
+            real_bt = float(state.time_ms)
 
-        # Stop if osu! ends the map (play_mode changes) or user quits.
-        if state.is_paused:
-            if args.verbose:
-                print(f"[live] paused at {bt:.0f}ms; holding")
-            time.sleep(0.1)
-            continue
+            # Drop obviously-bad reads (uninitialized / past map)
+            if real_bt < 0 or real_bt > bm_end:
+                if args.verbose:
+                    print(f"[live] resync: bad real_bt={real_bt:.0f}, keeping extrap={bt:.0f}")
+            elif state.is_paused:
+                if args.verbose:
+                    print(f"[live] resync: PAUSED at {real_bt:.0f}ms; freezing extrap")
+                # Freeze: re-anchor to current real time, pin now_perf
+                anchor_perf = time.perf_counter()
+                anchor_bt   = real_bt
+                time.sleep(0.1)
+                continue
+            else:
+                # Good read. Check drift vs extrap, re-anchor.
+                drift = bt - real_bt
+                if abs(drift) > DRIFT_WARN_MS and args.verbose:
+                    print(f"[live] resync: extrap drifted {drift:+.0f}ms (real={real_bt:.0f} "
+                          f"vs extrap={bt:.0f}); re-anchoring")
+                anchor_perf = time.perf_counter()
+                anchor_bt   = real_bt
+                bt = real_bt  # use the fresh real value for THIS tick's dispatch
 
-        last_sane_bt = bt
-
-        # Periodic status line
-        if args.verbose and (time.perf_counter() - last_dbg_wall) > 1.0:
-            last_dbg_wall = time.perf_counter()
+        # Periodic status line (independent of resync)
+        if args.verbose and (now_perf - last_dbg_wall) > 1.0:
+            last_dbg_wall = now_perf
             print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
                   f"to_release={len(dispatcher._to_release)}  ticks={tick_count}")
 
         dispatcher.tick(bt)
 
-        # Simple exit: when we've been past all HOs for 2 seconds
+        # Exit when queue is drained and we're past map end
         if (not dispatcher._pending and not dispatcher._to_release
                 and bt > start_bt + 2000):
             break
 
-    # Cleanup: release any lingering CFG overrides.
     sink.detach()
-    print(f"[live] done.")
+    print(f"[live] done. ticks={tick_count}")
     return 0
 
 
@@ -357,11 +385,12 @@ def main():
     ap.add_argument("--plan-hz", type=float, default=30.0,
                     help="(mock only) how often to re-plan upcoming presses")
     ap.add_argument("--lookahead-ms", type=float, default=400.0)
-    ap.add_argument("--press-lead-ms", type=float, default=150.0,
+    ap.add_argument("--press-lead-ms", type=float, default=50.0,
                     help="(live only) fire presses N ms earlier than planned "
-                         "to compensate for AoSink subprocess latency. "
-                         "Default 150ms is a starting guess; tune to match "
-                         "observed lag. 0 disables compensation.")
+                         "to compensate for AoSink subprocess latency. With "
+                         "the wall-clock extrapolator the inherent reader "
+                         "latency is zero, so only the per-press shell-out "
+                         "(~50-100ms) needs compensating. Tune per setup.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
