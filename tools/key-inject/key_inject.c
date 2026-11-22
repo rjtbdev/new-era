@@ -49,6 +49,11 @@ static const char *kgs_aob = "e8 ? ? ? ? 33 f6 8b 5f 04 3b f3 73 ? f6 44 37 08 8
  */
 static const char *kb_aob = "ff 15 ? ? ? ? 89 ? ? 8d ? ? 50 8b 0d ? ? ? ? 8b 55 ? ? ? ff";
 
+/* time_hook (from AQN): resolve the osu! time field VA for in-hook reads.
+ * match + 0x24 is the 4-byte displacement = session VA of the time field.
+ */
+static const char *time_aob = "74 12 a1 ? ? ? ? 2b 05 ? ? ? ? a3";
+
 static void die(const char* msg) { fprintf(stderr, "error: %s\n", msg); exit(1); }
 
 /* ------- pattern parsing + sigscan (same as cursor_capture) ------- */
@@ -140,6 +145,7 @@ typedef struct {
     uint64_t base;
     uint64_t kgs_match;       /* VA of the `e8 ... call GetKeyboardState` */
     uint32_t k1_vk, k2_vk;    /* byte indices into 256-byte state buffer */
+    uint32_t time_va;         /* VA of osu's beatmap-time int32 field */
 } resolution;
 
 static int do_resolve_core(resolution *r)
@@ -160,6 +166,10 @@ static int do_resolve_core(resolution *r)
 
     r->kgs_match = find_sig(r->cr3, r->base, kgs_aob);
     if (r->kgs_match == 0) die("keyboard_get_state sig did not match");
+
+    uint64_t time_match = find_sig(r->cr3, r->base, time_aob);
+    if (time_match == 0) die("time_hook sig did not match");
+    r->time_va = read_u32_at(r->cr3, time_match + 0x24);
 
     return 0;
 }
@@ -258,6 +268,17 @@ static int do_install(void)
     uint32_t k2_off = 8 + (r.k2_vk & 0xFF);
 
     ph_insn scriptB[] = {
+        /* Stash osu time into the log ring every call. Fires at osu's
+         * keyboard-poll rate (observed ~1kHz), giving us a fresh beatmap
+         * time without any user-mode shell-out.
+         *   R3 = time_va  (absolute VA)
+         *   R2 = *time_va (int32 beatmap time ms)
+         *   LOG R2, 0     -> ph_log_entry.a = time, .b = 0 (tag)
+         */
+        PH_LOADI(PH_R3, r.time_va),
+        PH_READ4(PH_R2, PH_R3, 0),
+        PH_LOG(PH_R2, 0),
+
         /* K1 branch: if CFG0 != 0, write CFG1 to [EDI + k1_off] */
         PH_LOADI(PH_R0, 0),
         PH_CMP(PH_CFG0, PH_R0),
@@ -296,6 +317,8 @@ static int do_install(void)
     printf("      CFG1 = K1 value (0x80 = pressed, 0x00 = released)\n");
     printf("      CFG2 = K2 enable\n");
     printf("      CFG3 = K2 value\n");
+    printf("[+] time logging: fresh beatmap time emitted into ph_log at every fire\n");
+    printf("      drain with `key_inject watch` or ao_ph_log_read from Python\n");
     printf("[+] use `key_inject press k1|k2|both <ms>` to try it.\n");
     printf("[+] use `key_inject remove` when done.\n");
     return 0;

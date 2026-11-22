@@ -40,6 +40,7 @@ from live.dispatcher import Dispatcher
 from live.model_service import ModelService
 from live.mock_reader import MockReader
 from live.sink import AoSink, MockSink
+from live.time_poller import TimePoller
 from src.models.rules import RuleConfig
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
@@ -277,33 +278,49 @@ def run_live(args, *, dry_run: bool):
 
     dispatcher.submit(decisions)
 
-    # ---- Tick loop with local wall-clock extrapolation ----
+    # ---- Tick loop with TimePoller anchor + wall-clock extrapolation ----
     #
-    # Problem with per-tick reader.read(): each call spawns 3 subprocess
-    # (time/is_paused/play_mode) at ~50-80ms each → effective 2-3 Hz loop,
-    # massive jitter, presses fire way late or in bursts. The
-    # press_lead_ms knob was a band-aid for this.
+    # TimePoller runs in a background thread, draining the ph_log ring
+    # every 50ms. The key_inject hook B emits a log entry with the current
+    # osu time (as entry.a) on every GetKeyboardState call (observed ~1kHz).
+    # So the poller always has a very fresh (bt, perf) anchor pair.
     #
-    # Fix: osu's time field is a monotonic ms counter advancing at wall
-    # rate (speed_mult 1.0 nomod, 1.5 DT, 0.75 HT). Between actual reads,
-    # extrapolate: now_bt = anchor_bt + (perf - anchor_perf)*1000*speed.
-    # Re-anchor every RESYNC_INTERVAL by reading real osu time & checking
-    # drift. This makes the tick loop pure-Python at microsecond
-    # granularity; only the resync hits the HV.
+    # Main tick loop: extrapolate bt = anchor_bt + (perf_now - anchor_perf)
+    # * 1000 * speed_mult. Re-anchor whenever TimePoller has newer data.
+    # Zero per-tick HV shell-outs. Tick runs at the requested poll_hz
+    # (default 200Hz = 5ms).
     poll_hz = args.poll_hz
     tick_dt = 1.0 / poll_hz
-    RESYNC_INTERVAL_S = 0.5  # re-read osu time every 500ms
-    DRIFT_WARN_MS    = 50.0  # log if extrapolation drifts this far from real
     bm_end = max((h.t for h in reader._hit_objects), default=0.0) + 5000.0
-    speed_mult = state.speed_mult  # 1.0 / 1.5 / 0.75 depending on mods
+    speed_mult = state.speed_mult
 
-    # Anchor: the pair (wall_time, osu_time) we're extrapolating from.
-    anchor_perf = time.perf_counter()
-    anchor_bt   = float(state.time_ms)
-    last_resync_perf = anchor_perf
+    # Start the background time poller
+    time_poller = TimePoller(drain_interval_s=0.05)
+    time_poller.start()
+    print(f"[live] TimePoller started (draining ph_log every 50ms)")
+
+    # Wait up to 1s for first sample
+    tp_wait_start = time.perf_counter()
+    while time_poller.latest_time_ms() is None and time.perf_counter() - tp_wait_start < 1.0:
+        time.sleep(0.02)
+    first_tp = time_poller.latest_time_ms()
+    if first_tp is None:
+        print("[live] WARN: TimePoller got no samples in 1s. Is key_inject hook "
+              "installed with the time-logging variant? Falling back to initial state.")
+        anchor_perf = time.perf_counter()
+        anchor_bt   = float(state.time_ms)
+        anchor_source = "state"
+    else:
+        tp_bt, tp_perf = time_poller.latest()
+        anchor_perf = tp_perf
+        anchor_bt   = tp_bt
+        anchor_source = "TimePoller"
+        print(f"[live] first TimePoller sample: bt={tp_bt:.0f}ms")
+
+    last_anchor_tp_bt = anchor_bt
     start_bt = anchor_bt
     tick_count = 0
-    last_dbg_wall = anchor_perf
+    last_dbg_wall = time.perf_counter()
 
     while True:
         wall = time.perf_counter()
@@ -312,53 +329,41 @@ def run_live(args, *, dry_run: bool):
             time.sleep(sleep_dt)
 
         now_perf = time.perf_counter()
-        # Extrapolate osu beatmap time from the last anchor
-        bt = anchor_bt + (now_perf - anchor_perf) * 1000.0 * speed_mult
         tick_count += 1
 
-        # Periodic resync: compare extrapolation to real osu time; re-anchor
-        if now_perf - last_resync_perf >= RESYNC_INTERVAL_S:
-            last_resync_perf = now_perf
-            state = reader.read()
-            real_bt = float(state.time_ms)
+        # Check TimePoller for a newer anchor
+        tp_bt, tp_perf = time_poller.latest()
+        if tp_bt is not None and tp_bt != last_anchor_tp_bt:
+            # New sample. Re-anchor if monotonic (ignore anomalies).
+            if tp_bt >= last_anchor_tp_bt - 100:  # allow small jitter
+                anchor_perf = tp_perf
+                anchor_bt   = tp_bt
+                last_anchor_tp_bt = tp_bt
 
-            # Drop obviously-bad reads (uninitialized / past map)
-            if real_bt < 0 or real_bt > bm_end:
-                if args.verbose:
-                    print(f"[live] resync: bad real_bt={real_bt:.0f}, keeping extrap={bt:.0f}")
-            elif state.is_paused:
-                if args.verbose:
-                    print(f"[live] resync: PAUSED at {real_bt:.0f}ms; freezing extrap")
-                # Freeze: re-anchor to current real time, pin now_perf
-                anchor_perf = time.perf_counter()
-                anchor_bt   = real_bt
-                time.sleep(0.1)
-                continue
-            else:
-                # Good read. Check drift vs extrap, re-anchor.
-                drift = bt - real_bt
-                if abs(drift) > DRIFT_WARN_MS and args.verbose:
-                    print(f"[live] resync: extrap drifted {drift:+.0f}ms (real={real_bt:.0f} "
-                          f"vs extrap={bt:.0f}); re-anchoring")
-                anchor_perf = time.perf_counter()
-                anchor_bt   = real_bt
-                bt = real_bt  # use the fresh real value for THIS tick's dispatch
+        bt = anchor_bt + (now_perf - anchor_perf) * 1000.0 * speed_mult
 
-        # Periodic status line (independent of resync)
+        # Sanity clamp (shouldn't happen with poller but defensive)
+        if bt > bm_end or bt < 0:
+            if args.verbose:
+                print(f"[live] skip bad bt={bt:.0f}")
+            continue
+
+        # Periodic status line
         if args.verbose and (now_perf - last_dbg_wall) > 1.0:
             last_dbg_wall = now_perf
             print(f"[live] t={bt:>6.0f}ms  pending={len(dispatcher._pending)}  "
-                  f"to_release={len(dispatcher._to_release)}  ticks={tick_count}")
+                  f"to_release={len(dispatcher._to_release)}  ticks={tick_count}  "
+                  f"drained={time_poller.drain_count()}  src={anchor_source}")
 
         dispatcher.tick(bt)
 
-        # Exit when queue is drained and we're past map end
         if (not dispatcher._pending and not dispatcher._to_release
                 and bt > start_bt + 2000):
             break
 
+    time_poller.stop()
     sink.detach()
-    print(f"[live] done. ticks={tick_count}")
+    print(f"[live] done. ticks={tick_count} drained={time_poller.drain_count()}")
     return 0
 
 
@@ -385,12 +390,11 @@ def main():
     ap.add_argument("--plan-hz", type=float, default=30.0,
                     help="(mock only) how often to re-plan upcoming presses")
     ap.add_argument("--lookahead-ms", type=float, default=400.0)
-    ap.add_argument("--press-lead-ms", type=float, default=50.0,
-                    help="(live only) fire presses N ms earlier than planned "
-                         "to compensate for AoSink subprocess latency. With "
-                         "the wall-clock extrapolator the inherent reader "
-                         "latency is zero, so only the per-press shell-out "
-                         "(~50-100ms) needs compensating. Tune per setup.")
+    ap.add_argument("--press-lead-ms", type=float, default=0.0,
+                    help="(live only) fire presses N ms earlier than planned. "
+                         "With TimePoller the time anchor is kHz-fresh and "
+                         "AoSink per-press latency is the only cost (~30-50ms). "
+                         "Tune to taste; 0-50ms is the expected range.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
